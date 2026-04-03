@@ -155,7 +155,10 @@ function extractTrackMetadata(oembed) {
 
 function extractPlaylistTracks(html) {
   const nextData = extractNextDataJson(html);
-  const rawTracks = nextData?.props?.pageProps?.state?.data?.entity?.tracks;
+  const rawTrackList = nextData?.props?.pageProps?.state?.data?.entity?.trackList;
+  const rawTracks = Array.isArray(rawTrackList)
+    ? rawTrackList
+    : (rawTrackList && typeof rawTrackList === 'object' ? Object.values(rawTrackList) : []);
 
   if (!Array.isArray(rawTracks) || rawTracks.length === 0) {
     throw createError(500, 'playlist_tracks_missing', 'Could not read tracks from the Spotify playlist embed.');

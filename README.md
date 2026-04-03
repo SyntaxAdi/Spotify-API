@@ -1,13 +1,12 @@
 # Spotify Metadata API
 
-A minimal Vercel-ready API that accepts a Spotify playlist URL or track URL and returns metadata as JSON using the official Spotify Web API.
+A minimal Vercel-ready API that accepts a Spotify playlist URL or track URL and returns only:
 
-## Environment variables
+- `thumbnail_url`
+- `song_name`
+- `artist_name`
 
-Add these in Vercel Project Settings -> Environment Variables:
-
-- `SPOTIFY_CLIENT_ID`
-- `SPOTIFY_CLIENT_SECRET`
+This version does not use Spotify Web API credentials. It reads public Spotify page metadata instead.
 
 ## Usage
 

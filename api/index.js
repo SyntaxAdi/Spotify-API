@@ -1,9 +1,6 @@
 'use strict';
 
-const SPOTIFY_TOKEN_URL = 'https://accounts.spotify.com/api/token';
-const SPOTIFY_API_BASE = 'https://api.spotify.com/v1';
 const SUPPORTED_TYPES = new Set(['track', 'playlist']);
-const DEFAULT_MARKET = process.env.SPOTIFY_MARKET || 'US';
 
 module.exports = async function handler(req, res) {
   setJsonHeaders(res);
@@ -21,67 +18,26 @@ module.exports = async function handler(req, res) {
     return;
   }
 
-  const clientId = process.env.SPOTIFY_CLIENT_ID;
-  const clientSecret = process.env.SPOTIFY_CLIENT_SECRET;
-
-  if (!clientId || !clientSecret) {
-    res.status(500).json({
-      error: 'missing_spotify_credentials',
-      message: 'Set SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET in your Vercel environment variables.'
-    });
-    return;
-  }
-
   try {
     const spotifyUrl = getIncomingUrl(req);
-    const market = getIncomingMarket(req);
 
     if (!spotifyUrl) {
       res.status(400).json({
         error: 'missing_url',
-        message: 'Provide a Spotify playlist or track URL using ?url=... or a POST body with { "url": "..." }.',
-        example: {
-          get: '/?url=https://open.spotify.com/track/11dFghVXANMlKmJXsNCbNl',
-          post: {
-            url: 'https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M'
-          }
-        }
+        message: 'Provide a Spotify track or playlist URL using ?url=... or a POST body with { "url": "..." }.'
       });
       return;
     }
 
     const parsed = parseSpotifyUrl(spotifyUrl);
-    const accessToken = await getAccessToken(clientId, clientSecret);
+    const html = await fetchSpotifyPage(spotifyUrl);
+    const metadata = extractMetadata(html, parsed.type);
 
-    if (parsed.type === 'track') {
-      const track = await spotifyFetch(`/tracks/${parsed.id}?market=${encodeURIComponent(market)}`, accessToken);
-
-      res.status(200).json({
-        ok: true,
-        type: 'track',
-        input_url: spotifyUrl,
-        market,
-        metadata: normalizeTrack(track)
-      });
-      return;
-    }
-
-    const playlist = await fetchPlaylistWithTracks(parsed.id, accessToken, market);
-
-    res.status(200).json({
-      ok: true,
-      type: 'playlist',
-      input_url: spotifyUrl,
-      market,
-      metadata: playlist
-    });
+    res.status(200).json(metadata);
   } catch (error) {
-    const status = error.statusCode || 500;
-
-    res.status(status).json({
+    res.status(error.statusCode || 500).json({
       error: error.code || 'internal_error',
-      message: error.message || 'Something went wrong while fetching Spotify metadata.',
-      spotify: error.spotify || undefined
+      message: error.message || 'Something went wrong while fetching metadata.'
     });
   }
 };
@@ -116,39 +72,6 @@ function getIncomingUrl(req) {
   return typeof body.url === 'string' ? body.url.trim() : '';
 }
 
-function getIncomingMarket(req) {
-  if (req.method === 'GET') {
-    const market = typeof req.query?.market === 'string' ? req.query.market.trim().toUpperCase() : '';
-    return normalizeMarket(market);
-  }
-
-  const body = req.body;
-
-  if (!body) {
-    return DEFAULT_MARKET;
-  }
-
-  if (typeof body === 'string') {
-    try {
-      const parsedBody = JSON.parse(body);
-      return normalizeMarket(parsedBody?.market);
-    } catch {
-      return DEFAULT_MARKET;
-    }
-  }
-
-  return normalizeMarket(body.market);
-}
-
-function normalizeMarket(market) {
-  if (typeof market !== 'string') {
-    return DEFAULT_MARKET;
-  }
-
-  const trimmed = market.trim().toUpperCase();
-  return /^[A-Z]{2}$/.test(trimmed) ? trimmed : DEFAULT_MARKET;
-}
-
 function parseSpotifyUrl(input) {
   let url;
 
@@ -169,127 +92,104 @@ function parseSpotifyUrl(input) {
     throw createError(400, 'unsupported_spotify_url', 'Only Spotify track and playlist URLs are supported.');
   }
 
-  const id = rawId.split('?')[0];
-
-  if (!/^[A-Za-z0-9]+$/.test(id)) {
-    throw createError(400, 'invalid_spotify_id', 'The Spotify URL does not contain a valid resource ID.');
-  }
-
-  return { type, id };
+  return { type, id: rawId };
 }
 
-async function getAccessToken(clientId, clientSecret) {
-  const basicAuth = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
-  const response = await fetch(SPOTIFY_TOKEN_URL, {
-    method: 'POST',
+async function fetchSpotifyPage(spotifyUrl) {
+  const response = await fetch(spotifyUrl, {
     headers: {
-      Authorization: `Basic ${basicAuth}`,
-      'Content-Type': 'application/x-www-form-urlencoded'
-    },
-    body: new URLSearchParams({ grant_type: 'client_credentials' })
-  });
-
-  const data = await response.json().catch(() => ({}));
-
-  if (!response.ok || !data.access_token) {
-    throw createError(
-      response.status || 500,
-      'spotify_auth_failed',
-      data.error_description || 'Unable to authenticate with Spotify. Check your client ID and client secret.'
-    );
-  }
-
-  return data.access_token;
-}
-
-async function spotifyFetch(pathname, accessToken) {
-  const response = await fetch(`${SPOTIFY_API_BASE}${pathname}`, {
-    headers: {
-      Authorization: `Bearer ${accessToken}`
+      'User-Agent': 'Mozilla/5.0 (compatible; SpotifyMetadataBot/1.0)',
+      Accept: 'text/html,application/xhtml+xml'
     }
   });
-
-  const data = await response.json().catch(() => ({}));
 
   if (!response.ok) {
-    const status = response.status || 500;
-    const message =
-      data?.error?.message ||
-      `Spotify API request failed for ${pathname}.`;
+    throw createError(response.status || 500, 'spotify_page_fetch_failed', 'Unable to fetch the Spotify page.');
+  }
 
-    if (status === 404) {
-      throw createError(404, 'not_found', message);
+  return response.text();
+}
+
+function extractMetadata(html, type) {
+  const pageTitle = decodeHtmlEntities(findTagContent(html, 'title'));
+  const thumbnailUrl = findMetaContent(html, 'property', 'og:image') || null;
+
+  if (!pageTitle) {
+    throw createError(500, 'missing_page_title', 'Could not read metadata from the Spotify page.');
+  }
+
+  if (type === 'track') {
+    const match = pageTitle.match(/^(.*?) - song and lyrics by (.*?) \| Spotify$/i);
+
+    if (!match) {
+      throw createError(500, 'track_parse_failed', 'Could not parse track metadata from the Spotify page.');
     }
 
-    throw createError(status, 'spotify_api_error', message, data);
+    return {
+      thumbnail_url: thumbnailUrl,
+      song_name: cleanValue(match[1]),
+      artist_name: cleanValue(match[2])
+    };
   }
 
-  return data;
+  const playlistMatch = pageTitle.match(/^(.*?) - playlist by (.*?) \| Spotify$/i);
+
+  if (!playlistMatch) {
+    throw createError(500, 'playlist_parse_failed', 'Could not parse playlist metadata from the Spotify page.');
+  }
+
+  return {
+    thumbnail_url: thumbnailUrl,
+    song_name: cleanValue(playlistMatch[1]),
+    artist_name: cleanValue(playlistMatch[2])
+  };
 }
 
-async function fetchPlaylistWithTracks(playlistId, accessToken, market) {
-  const playlist = await spotifyFetch(
-    `/playlists/${playlistId}?market=${encodeURIComponent(market)}&fields=id,name,description,public,collaborative,external_urls,href,images,owner(id,display_name,external_urls),followers(total),snapshot_id,tracks(total,limit,next,offset,items(added_at,added_by(id),track(id,name,album(id,name,release_date,images,external_urls),artists(id,name,external_urls),disc_number,duration_ms,explicit,external_ids,external_urls,is_local,is_playable,preview_url,track_number,type,uri,popularity)))`,
-    accessToken
+function findTagContent(html, tagName) {
+  const regex = new RegExp(`<${tagName}[^>]*>([\\s\\S]*?)<\\/${tagName}>`, 'i');
+  return html.match(regex)?.[1]?.trim() || '';
+}
+
+function findMetaContent(html, attrName, attrValue) {
+  const regex = new RegExp(
+    `<meta[^>]*${attrName}=["']${escapeRegExp(attrValue)}["'][^>]*content=["']([^"']+)["'][^>]*>`,
+    'i'
   );
 
-  const items = [...(playlist.tracks.items || [])];
-  let nextUrl = playlist.tracks.next;
+  const directMatch = html.match(regex)?.[1];
 
-  while (nextUrl) {
-    const nextPath = nextUrl.replace(`${SPOTIFY_API_BASE}`, '');
-    const page = await spotifyFetch(nextPath, accessToken);
-    items.push(...(page.items || []));
-    nextUrl = page.next;
+  if (directMatch) {
+    return decodeHtmlEntities(directMatch.trim());
   }
 
-  return {
-    id: playlist.id,
-    name: playlist.name,
-    description: playlist.description,
-    public: playlist.public,
-    collaborative: playlist.collaborative,
-    snapshot_id: playlist.snapshot_id,
-    href: playlist.href,
-    external_urls: playlist.external_urls,
-    images: playlist.images,
-    followers: playlist.followers,
-    owner: playlist.owner,
-    tracks_total: playlist.tracks.total,
-    tracks: items.map((item) => ({
-      added_at: item.added_at,
-      added_by: item.added_by,
-      track: item.track ? normalizeTrack(item.track) : null
-    }))
-  };
+  const reversedRegex = new RegExp(
+    `<meta[^>]*content=["']([^"']+)["'][^>]*${attrName}=["']${escapeRegExp(attrValue)}["'][^>]*>`,
+    'i'
+  );
+
+  return decodeHtmlEntities(reversedRegex.exec(html)?.[1]?.trim() || '');
 }
 
-function normalizeTrack(track) {
-  return {
-    id: track.id,
-    name: track.name,
-    type: track.type,
-    uri: track.uri,
-    href: track.href,
-    external_urls: track.external_urls,
-    external_ids: track.external_ids,
-    duration_ms: track.duration_ms,
-    explicit: track.explicit,
-    popularity: track.popularity,
-    preview_url: track.preview_url,
-    track_number: track.track_number,
-    disc_number: track.disc_number,
-    is_local: track.is_local,
-    is_playable: track.is_playable,
-    artists: track.artists,
-    album: track.album
-  };
+function cleanValue(value) {
+  return decodeHtmlEntities(value).replace(/\s+/g, ' ').trim();
 }
 
-function createError(statusCode, code, message, spotify) {
+function decodeHtmlEntities(value) {
+  return value
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>');
+}
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function createError(statusCode, code, message) {
   const error = new Error(message);
   error.statusCode = statusCode;
   error.code = code;
-  error.spotify = spotify;
   return error;
 }

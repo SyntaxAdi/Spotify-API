@@ -30,10 +30,18 @@ module.exports = async function handler(req, res) {
     }
 
     const parsed = parseSpotifyUrl(spotifyUrl);
-    const html = await fetchSpotifyPage(spotifyUrl);
-    const metadata = extractMetadata(html, parsed.type);
 
-    res.status(200).json(metadata);
+    if (parsed.type === 'track') {
+      const oembed = await fetchSpotifyOEmbed(spotifyUrl);
+      res.status(200).json(extractTrackMetadata(oembed));
+      return;
+    }
+
+    const playlistHtml = await fetchSpotifyEmbedPage(parsed.id);
+    const playlistTracks = extractPlaylistTracks(playlistHtml);
+    const enrichedTracks = await enrichPlaylistTracks(playlistTracks);
+
+    res.status(200).json(enrichedTracks);
   } catch (error) {
     res.status(error.statusCode || 500).json({
       error: error.code || 'internal_error',
@@ -110,7 +118,26 @@ async function fetchSpotifyPage(spotifyUrl) {
   return response.json();
 }
 
-function extractMetadata(oembed, type) {
+async function fetchSpotifyOEmbed(spotifyUrl) {
+  return fetchSpotifyPage(spotifyUrl);
+}
+
+async function fetchSpotifyEmbedPage(playlistId) {
+  const embedUrl = `https://open.spotify.com/embed/playlist/${encodeURIComponent(playlistId)}?utm_source=oembed`;
+  const response = await fetch(embedUrl, {
+    headers: {
+      Accept: 'text/html'
+    }
+  });
+
+  if (!response.ok) {
+    throw createError(response.status || 500, 'spotify_embed_fetch_failed', 'Unable to fetch Spotify playlist data.');
+  }
+
+  return response.text();
+}
+
+function extractTrackMetadata(oembed) {
   const title = cleanValue(oembed?.title || '');
   const thumbnailUrl = typeof oembed?.thumbnail_url === 'string' ? oembed.thumbnail_url : null;
   const authorName = cleanValue(oembed?.author_name || '');
@@ -119,19 +146,80 @@ function extractMetadata(oembed, type) {
     throw createError(500, 'missing_title', 'Could not read metadata from Spotify oEmbed.');
   }
 
-  if (type === 'track') {
-    return {
-      thumbnail_url: thumbnailUrl,
-      song_name: title,
-      artist_name: authorName
-    };
-  }
-
   return {
     thumbnail_url: thumbnailUrl,
     song_name: title,
     artist_name: authorName
   };
+}
+
+function extractPlaylistTracks(html) {
+  const nextData = extractNextDataJson(html);
+  const rawTracks = nextData?.props?.pageProps?.state?.data?.entity?.tracks;
+
+  if (!Array.isArray(rawTracks) || rawTracks.length === 0) {
+    throw createError(500, 'playlist_tracks_missing', 'Could not read tracks from the Spotify playlist embed.');
+  }
+
+  return rawTracks
+    .filter((track) => track?.entityType === 'track' && typeof track?.uri === 'string')
+    .map((track) => ({
+      track_id: extractTrackIdFromUri(track.uri),
+      song_name: cleanValue(track.title || ''),
+      artist_name: cleanValue(track.subtitle || '')
+    }))
+    .filter((track) => track.track_id && track.song_name);
+}
+
+function extractNextDataJson(html) {
+  const match = html.match(/<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/i);
+
+  if (!match?.[1]) {
+    throw createError(500, 'missing_next_data', 'Could not locate playlist data in the Spotify embed page.');
+  }
+
+  try {
+    return JSON.parse(match[1]);
+  } catch {
+    throw createError(500, 'invalid_next_data', 'Could not parse playlist data from the Spotify embed page.');
+  }
+}
+
+function extractTrackIdFromUri(uri) {
+  const match = uri.match(/^spotify:track:([A-Za-z0-9]+)$/);
+  return match ? match[1] : '';
+}
+
+async function enrichPlaylistTracks(tracks) {
+  const concurrency = 8;
+  const results = [];
+
+  for (let index = 0; index < tracks.length; index += concurrency) {
+    const chunk = tracks.slice(index, index + concurrency);
+    const enrichedChunk = await Promise.all(chunk.map(enrichSingleTrack));
+    results.push(...enrichedChunk);
+  }
+
+  return results;
+}
+
+async function enrichSingleTrack(track) {
+  const spotifyUrl = `https://open.spotify.com/track/${track.track_id}`;
+
+  try {
+    const oembed = await fetchSpotifyOEmbed(spotifyUrl);
+    return {
+      thumbnail_url: typeof oembed?.thumbnail_url === 'string' ? oembed.thumbnail_url : null,
+      song_name: track.song_name,
+      artist_name: track.artist_name
+    };
+  } catch {
+    return {
+      thumbnail_url: null,
+      song_name: track.song_name,
+      artist_name: track.artist_name
+    };
+  }
 }
 
 function cleanValue(value) {

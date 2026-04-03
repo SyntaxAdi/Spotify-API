@@ -96,78 +96,42 @@ function parseSpotifyUrl(input) {
 }
 
 async function fetchSpotifyPage(spotifyUrl) {
-  const response = await fetch(spotifyUrl, {
+  const oembedUrl = `https://open.spotify.com/oembed?url=${encodeURIComponent(spotifyUrl)}`;
+  const response = await fetch(oembedUrl, {
     headers: {
-      'User-Agent': 'Mozilla/5.0 (compatible; SpotifyMetadataBot/1.0)',
-      Accept: 'text/html,application/xhtml+xml'
+      Accept: 'application/json'
     }
   });
 
   if (!response.ok) {
-    throw createError(response.status || 500, 'spotify_page_fetch_failed', 'Unable to fetch the Spotify page.');
+    throw createError(response.status || 500, 'spotify_oembed_fetch_failed', 'Unable to fetch Spotify metadata.');
   }
 
-  return response.text();
+  return response.json();
 }
 
-function extractMetadata(html, type) {
-  const pageTitle = decodeHtmlEntities(findTagContent(html, 'title'));
-  const thumbnailUrl = findMetaContent(html, 'property', 'og:image') || null;
+function extractMetadata(oembed, type) {
+  const title = cleanValue(oembed?.title || '');
+  const thumbnailUrl = typeof oembed?.thumbnail_url === 'string' ? oembed.thumbnail_url : null;
+  const authorName = cleanValue(oembed?.author_name || '');
 
-  if (!pageTitle) {
-    throw createError(500, 'missing_page_title', 'Could not read metadata from the Spotify page.');
+  if (!title) {
+    throw createError(500, 'missing_title', 'Could not read metadata from Spotify oEmbed.');
   }
 
   if (type === 'track') {
-    const match = pageTitle.match(/^(.*?) - song and lyrics by (.*?) \| Spotify$/i);
-
-    if (!match) {
-      throw createError(500, 'track_parse_failed', 'Could not parse track metadata from the Spotify page.');
-    }
-
     return {
       thumbnail_url: thumbnailUrl,
-      song_name: cleanValue(match[1]),
-      artist_name: cleanValue(match[2])
+      song_name: title,
+      artist_name: authorName
     };
-  }
-
-  const playlistMatch = pageTitle.match(/^(.*?) - playlist by (.*?) \| Spotify$/i);
-
-  if (!playlistMatch) {
-    throw createError(500, 'playlist_parse_failed', 'Could not parse playlist metadata from the Spotify page.');
   }
 
   return {
     thumbnail_url: thumbnailUrl,
-    song_name: cleanValue(playlistMatch[1]),
-    artist_name: cleanValue(playlistMatch[2])
+    song_name: title,
+    artist_name: authorName
   };
-}
-
-function findTagContent(html, tagName) {
-  const regex = new RegExp(`<${tagName}[^>]*>([\\s\\S]*?)<\\/${tagName}>`, 'i');
-  return html.match(regex)?.[1]?.trim() || '';
-}
-
-function findMetaContent(html, attrName, attrValue) {
-  const regex = new RegExp(
-    `<meta[^>]*${attrName}=["']${escapeRegExp(attrValue)}["'][^>]*content=["']([^"']+)["'][^>]*>`,
-    'i'
-  );
-
-  const directMatch = html.match(regex)?.[1];
-
-  if (directMatch) {
-    return decodeHtmlEntities(directMatch.trim());
-  }
-
-  const reversedRegex = new RegExp(
-    `<meta[^>]*content=["']([^"']+)["'][^>]*${attrName}=["']${escapeRegExp(attrValue)}["'][^>]*>`,
-    'i'
-  );
-
-  return decodeHtmlEntities(reversedRegex.exec(html)?.[1]?.trim() || '');
 }
 
 function cleanValue(value) {
@@ -181,10 +145,6 @@ function decodeHtmlEntities(value) {
     .replace(/&#39;/g, "'")
     .replace(/&lt;/g, '<')
     .replace(/&gt;/g, '>');
-}
-
-function escapeRegExp(value) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function createError(statusCode, code, message) {

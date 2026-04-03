@@ -1,0 +1,12 @@
+{
+  "name": "spotify-metadata-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Vercel API for fetching Spotify track and playlist metadata using the official Spotify Web API.",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "dev": "vercel dev"
+  }
+}

@@ -3,6 +3,7 @@
 const SPOTIFY_TOKEN_URL = 'https://accounts.spotify.com/api/token';
 const SPOTIFY_API_BASE = 'https://api.spotify.com/v1';
 const SUPPORTED_TYPES = new Set(['track', 'playlist']);
+const DEFAULT_MARKET = process.env.SPOTIFY_MARKET || 'US';
 
 module.exports = async function handler(req, res) {
   setJsonHeaders(res);
@@ -33,6 +34,7 @@ module.exports = async function handler(req, res) {
 
   try {
     const spotifyUrl = getIncomingUrl(req);
+    const market = getIncomingMarket(req);
 
     if (!spotifyUrl) {
       res.status(400).json({
@@ -52,23 +54,25 @@ module.exports = async function handler(req, res) {
     const accessToken = await getAccessToken(clientId, clientSecret);
 
     if (parsed.type === 'track') {
-      const track = await spotifyFetch(`/tracks/${parsed.id}`, accessToken);
+      const track = await spotifyFetch(`/tracks/${parsed.id}?market=${encodeURIComponent(market)}`, accessToken);
 
       res.status(200).json({
         ok: true,
         type: 'track',
         input_url: spotifyUrl,
+        market,
         metadata: normalizeTrack(track)
       });
       return;
     }
 
-    const playlist = await fetchPlaylistWithTracks(parsed.id, accessToken);
+    const playlist = await fetchPlaylistWithTracks(parsed.id, accessToken, market);
 
     res.status(200).json({
       ok: true,
       type: 'playlist',
       input_url: spotifyUrl,
+      market,
       metadata: playlist
     });
   } catch (error) {
@@ -76,7 +80,8 @@ module.exports = async function handler(req, res) {
 
     res.status(status).json({
       error: error.code || 'internal_error',
-      message: error.message || 'Something went wrong while fetching Spotify metadata.'
+      message: error.message || 'Something went wrong while fetching Spotify metadata.',
+      spotify: error.spotify || undefined
     });
   }
 };
@@ -109,6 +114,39 @@ function getIncomingUrl(req) {
   }
 
   return typeof body.url === 'string' ? body.url.trim() : '';
+}
+
+function getIncomingMarket(req) {
+  if (req.method === 'GET') {
+    const market = typeof req.query?.market === 'string' ? req.query.market.trim().toUpperCase() : '';
+    return normalizeMarket(market);
+  }
+
+  const body = req.body;
+
+  if (!body) {
+    return DEFAULT_MARKET;
+  }
+
+  if (typeof body === 'string') {
+    try {
+      const parsedBody = JSON.parse(body);
+      return normalizeMarket(parsedBody?.market);
+    } catch {
+      return DEFAULT_MARKET;
+    }
+  }
+
+  return normalizeMarket(body.market);
+}
+
+function normalizeMarket(market) {
+  if (typeof market !== 'string') {
+    return DEFAULT_MARKET;
+  }
+
+  const trimmed = market.trim().toUpperCase();
+  return /^[A-Z]{2}$/.test(trimmed) ? trimmed : DEFAULT_MARKET;
 }
 
 function parseSpotifyUrl(input) {
@@ -183,15 +221,15 @@ async function spotifyFetch(pathname, accessToken) {
       throw createError(404, 'not_found', message);
     }
 
-    throw createError(status, 'spotify_api_error', message);
+    throw createError(status, 'spotify_api_error', message, data);
   }
 
   return data;
 }
 
-async function fetchPlaylistWithTracks(playlistId, accessToken) {
+async function fetchPlaylistWithTracks(playlistId, accessToken, market) {
   const playlist = await spotifyFetch(
-    `/playlists/${playlistId}?fields=id,name,description,public,collaborative,external_urls,href,images,owner(id,display_name,external_urls),followers(total),snapshot_id,tracks(total,limit,next,offset,items(added_at,added_by(id),track(id,name,album(id,name,release_date,images,external_urls),artists(id,name,external_urls),disc_number,duration_ms,explicit,external_ids,external_urls,is_local,is_playable,preview_url,track_number,type,uri,popularity)))`,
+    `/playlists/${playlistId}?market=${encodeURIComponent(market)}&fields=id,name,description,public,collaborative,external_urls,href,images,owner(id,display_name,external_urls),followers(total),snapshot_id,tracks(total,limit,next,offset,items(added_at,added_by(id),track(id,name,album(id,name,release_date,images,external_urls),artists(id,name,external_urls),disc_number,duration_ms,explicit,external_ids,external_urls,is_local,is_playable,preview_url,track_number,type,uri,popularity)))`,
     accessToken
   );
 
@@ -248,9 +286,10 @@ function normalizeTrack(track) {
   };
 }
 
-function createError(statusCode, code, message) {
+function createError(statusCode, code, message, spotify) {
   const error = new Error(message);
   error.statusCode = statusCode;
   error.code = code;
+  error.spotify = spotify;
   return error;
 }

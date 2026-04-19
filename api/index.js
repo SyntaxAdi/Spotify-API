@@ -1,5 +1,7 @@
 'use strict';
 
+const SUPPORTED_TYPES = new Set(['track', 'playlist']);
+
 module.exports = async function handler(req, res) {
   setJsonHeaders(res);
 
@@ -17,37 +19,29 @@ module.exports = async function handler(req, res) {
   }
 
   try {
-    const inputUrl = getIncomingUrl(req);
+    const spotifyUrl = getIncomingUrl(req);
 
-    if (!inputUrl) {
+    if (!spotifyUrl) {
       res.status(400).json({
         error: 'missing_url',
-        message: 'Provide a Spotify or YouTube track/playlist URL using ?url=... or a POST body with { "url": "..." }.'
+        message: 'Provide a Spotify track or playlist URL using ?url=... or a POST body with { "url": "..." }.'
       });
       return;
     }
 
-    const parsed = parseUrl(inputUrl);
+    const parsed = parseSpotifyUrl(spotifyUrl);
 
-    if (parsed.service === 'spotify') {
-      if (parsed.type === 'track') {
-        const oembed = await fetchSpotifyOEmbed(inputUrl);
-        res.status(200).json(extractTrackMetadata(oembed));
-        return;
-      }
-
-      const playlistHtml = await fetchSpotifyEmbedPage(parsed.id);
-      const playlistTracks = extractPlaylistTracks(playlistHtml);
-      const enrichedTracks = await enrichPlaylistTracks(playlistTracks);
-
-      res.status(200).json(enrichedTracks);
-    } else if (parsed.service === 'youtube') {
-      if (parsed.type === 'playlist') {
-        const playlistTracks = await fetchYouTubePlaylist(parsed.id);
-        res.status(200).json(playlistTracks);
-        return;
-      }
+    if (parsed.type === 'track') {
+      const oembed = await fetchSpotifyOEmbed(spotifyUrl);
+      res.status(200).json(extractTrackMetadata(oembed));
+      return;
     }
+
+    const playlistHtml = await fetchSpotifyEmbedPage(parsed.id);
+    const playlistTracks = extractPlaylistTracks(playlistHtml);
+    const enrichedTracks = await enrichPlaylistTracks(playlistTracks);
+
+    res.status(200).json(enrichedTracks);
   } catch (error) {
     res.status(error.statusCode || 500).json({
       error: error.code || 'internal_error',
@@ -86,7 +80,7 @@ function getIncomingUrl(req) {
   return typeof body.url === 'string' ? body.url.trim() : '';
 }
 
-function parseUrl(input) {
+function parseSpotifyUrl(input) {
   let url;
 
   try {
@@ -95,31 +89,21 @@ function parseUrl(input) {
     throw createError(400, 'invalid_url', 'The provided value is not a valid URL.');
   }
 
-  const hostname = url.hostname.replace('www.', '');
-
-  if (['open.spotify.com', 'play.spotify.com'].includes(hostname)) {
-    const segments = url.pathname.split('/').filter(Boolean);
-    const [type, rawId] = segments;
-
-    if (!['track', 'playlist'].includes(type) || !rawId) {
-      throw createError(400, 'unsupported_spotify_url', 'Only Spotify track and playlist URLs are supported.');
-    }
-
-    return { service: 'spotify', type, id: rawId };
+  if (!['open.spotify.com', 'play.spotify.com'].includes(url.hostname)) {
+    throw createError(400, 'unsupported_host', 'Only Spotify track and playlist URLs are supported.');
   }
 
-  if (['youtube.com', 'youtu.be', 'm.youtube.com'].includes(hostname)) {
-    const list = url.searchParams.get('list');
-    if (list) {
-      return { service: 'youtube', type: 'playlist', id: list };
-    }
-    throw createError(400, 'unsupported_youtube_url', 'Only YouTube playlist URLs are supported.');
+  const segments = url.pathname.split('/').filter(Boolean);
+  const [type, rawId] = segments;
+
+  if (!SUPPORTED_TYPES.has(type) || !rawId) {
+    throw createError(400, 'unsupported_spotify_url', 'Only Spotify track and playlist URLs are supported.');
   }
 
-  throw createError(400, 'unsupported_host', 'Only Spotify and YouTube URLs are supported.');
+  return { type, id: rawId };
 }
 
-async function fetchSpotifyOEmbed(spotifyUrl) {
+async function fetchSpotifyPage(spotifyUrl) {
   const oembedUrl = `https://open.spotify.com/oembed?url=${encodeURIComponent(spotifyUrl)}`;
   const response = await fetch(oembedUrl, {
     headers: {
@@ -132,6 +116,10 @@ async function fetchSpotifyOEmbed(spotifyUrl) {
   }
 
   return response.json();
+}
+
+async function fetchSpotifyOEmbed(spotifyUrl) {
+  return fetchSpotifyPage(spotifyUrl);
 }
 
 async function fetchSpotifyEmbedPage(playlistId) {
@@ -149,56 +137,13 @@ async function fetchSpotifyEmbedPage(playlistId) {
   return response.text();
 }
 
-async function fetchYouTubePlaylist(playlistId) {
-  const url = `https://www.youtube.com/playlist?list=${playlistId}`;
-  const response = await fetch(url, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      'Accept-Language': 'en-US,en;q=0.9'
-    }
-  });
-
-  if (!response.ok) {
-    throw createError(response.status || 500, 'youtube_playlist_fetch_failed', 'Unable to fetch YouTube playlist data.');
-  }
-
-  const html = await response.text();
-  const match = html.match(/var ytInitialData = ({.*?});/s);
-  if (!match?.[1]) {
-    throw createError(500, 'missing_yt_data', 'Could not locate playlist data in the YouTube page.');
-  }
-
-  let jsonData;
-  try {
-    jsonData = JSON.parse(match[1]);
-  } catch {
-    throw createError(500, 'invalid_yt_data', 'Could not parse playlist data from the YouTube page.');
-  }
-
-  const contents = jsonData.contents?.twoColumnBrowseResultsRenderer?.tabs?.[0]?.tabRenderer?.content?.sectionListRenderer?.contents?.[0]?.itemSectionRenderer?.contents?.[0]?.playlistVideoListRenderer?.contents;
-
-  if (!Array.isArray(contents)) {
-    throw createError(500, 'playlist_tracks_missing', 'Could not read tracks from the YouTube playlist.');
-  }
-
-  return contents
-    .map(item => item.playlistVideoRenderer)
-    .filter(Boolean)
-    .map(video => ({
-      thumbnail_url: video.thumbnail?.thumbnails?.pop()?.url || null,
-      song_name: video.title?.runs?.[0]?.text || video.title?.accessibility?.accessibilityData?.label || 'Unknown Title',
-      artist_name: video.shortBylineText?.runs?.[0]?.text || 'Unknown Artist',
-      video_url: video.videoId ? `https://www.youtube.com/watch?v=${video.videoId}` : null
-    }));
-}
-
 function extractTrackMetadata(oembed) {
   const title = cleanValue(oembed?.title || '');
   const thumbnailUrl = typeof oembed?.thumbnail_url === 'string' ? oembed.thumbnail_url : null;
   const authorName = cleanValue(oembed?.author_name || '');
 
   if (!title) {
-    throw createError(500, 'missing_title', 'Could not read metadata from oEmbed.');
+    throw createError(500, 'missing_title', 'Could not read metadata from Spotify oEmbed.');
   }
 
   return {
